@@ -1,0 +1,11 @@
+fastapi==0.115.0
+uvicorn==0.30.6
+redis==5.0.8
+rq==1.16.2
+opencv-python-headless==4.10.0.84
+Pillow==10.4.0
+numpy==2.1.1
+requests==2.32.3
+pydantic==2.9.0
+ffmpeg-python==0.2.0
+psycopg2-binary==2.9.9
