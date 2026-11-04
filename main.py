@@ -1,6 +1,8 @@
+# main.py
 import os
 import shutil
 import threading
+from typing import Optional
 
 import psycopg2
 import psycopg2.extras
@@ -15,8 +17,12 @@ from slicer import (
     is_valid_chapter_folder,
     slice_chapter,
 )
+from ocr_vision import (
+    OcrError,
+    extract_chapter_ocr,
+)
 
-app = FastAPI(title="Video Machine - Slicer API", version="1.2.0")
+app = FastAPI(title="Video Machine - Slicer & OCR API", version="1.3.0")
 
 REDIS_HOST = os.getenv("REDIS_HOST", "n8n_redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
@@ -28,13 +34,23 @@ DB_NAME = os.getenv("DB_NAME", "video_machine")
 DB_USER = os.getenv("DB_USER", "n8n")
 DB_PASS = os.getenv("DB_PASS", "")
 
+OPENAI_API_KEY_ENV = os.getenv("OPENAI_API_KEY", "")
+
 # Impede dois fatiamentos pesados simultâneos (RAM limitada na VPS KVM2)
 slice_lock = threading.Lock()
+
+# Impede duas extrações de OCR/Vision simultâneas (controle de custo e carga)
+ocr_lock = threading.Lock()
 
 
 class SliceChapterRequest(BaseModel):
     chapter_id: int
     chapter_folder_name: str
+
+
+class ExtractOcrRequest(BaseModel):
+    chapter_id: int
+    openai_api_key: Optional[str] = None
 
 
 def get_db_connection():
@@ -247,6 +263,155 @@ def slice_chapter_endpoint(req: SliceChapterRequest):
                     "frame_16_9_path": p["frame_16_9_path"],
                 }
                 for p in panels
+            ],
+        },
+    )
+
+
+@app.post("/extract-ocr")
+def extract_ocr_endpoint(req: ExtractOcrRequest):
+    api_key = (req.openai_api_key or OPENAI_API_KEY_ENV).strip()
+    if not api_key:
+        raise HTTPException(
+            status_code=400,
+            detail="OPENAI_API_KEY não configurada (env ou openai_api_key no body)",
+        )
+
+    # Busca capítulo e cenas no banco
+    try:
+        conn = get_db_connection()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Falha ao conectar no PostgreSQL: {e}",
+        )
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, local_work_dir FROM chapters WHERE id = %s",
+                (req.chapter_id,),
+            )
+            chapter_row = cur.fetchone()
+
+            if chapter_row is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Capítulo {req.chapter_id} não encontrado",
+                )
+
+            cur.execute(
+                """
+                SELECT scene_order, panel_image_path
+                  FROM scenes
+                 WHERE chapter_id = %s
+                 ORDER BY scene_order
+                """,
+                (req.chapter_id,),
+            )
+            scene_rows = cur.fetchall()
+    finally:
+        conn.close()
+
+    chapter_dir = chapter_row[1]
+
+    if not chapter_dir:
+        raise HTTPException(
+            status_code=400,
+            detail="Capítulo sem local_work_dir. Execute /slice-chapter antes.",
+        )
+
+    if not scene_rows:
+        raise HTTPException(
+            status_code=400,
+            detail="Nenhuma cena encontrada para o capítulo. Execute /slice-chapter antes.",
+        )
+
+    scenes = [
+        {"scene_order": row[0], "frame_16_9_path": row[1]}
+        for row in scene_rows
+    ]
+
+    # Garante uma extração de OCR por vez
+    with ocr_lock:
+        try:
+            result = extract_chapter_ocr(
+                chapter_id=req.chapter_id,
+                chapter_dir=chapter_dir,
+                scenes=scenes,
+                api_key=api_key,
+            )
+        except OcrError as e:
+            msg = str(e)
+            _mark_chapter_error(req.chapter_id, msg)
+            raise HTTPException(status_code=502, detail=msg)
+        except Exception as e:
+            msg = f"Erro inesperado no OCR/Vision: {e}"
+            _mark_chapter_error(req.chapter_id, msg)
+            raise HTTPException(status_code=500, detail=msg)
+
+        frames = result["frames"]
+
+        # Persiste no PostgreSQL
+        conn = None
+        try:
+            conn = get_db_connection()
+            with conn:
+                with conn.cursor() as cur:
+                    for frame in frames:
+                        cur.execute(
+                            """
+                            UPDATE scenes
+                               SET extracted_ocr_text = %s
+                             WHERE chapter_id = %s
+                               AND scene_order = %s
+                            """,
+                            (
+                                frame["extracted_ocr_text"],
+                                req.chapter_id,
+                                frame["scene_order"],
+                            ),
+                        )
+
+                    cur.execute(
+                        """
+                        UPDATE chapters
+                           SET status = CASE
+                                   WHEN status = 'Erro' THEN 'Extração Concluída'
+                                   ELSE status
+                               END,
+                               error_log = NULL,
+                               updated_at = CURRENT_TIMESTAMP
+                         WHERE id = %s
+                        """,
+                        (req.chapter_id,),
+                    )
+        except Exception as e:
+            msg = f"Falha ao gravar o OCR no banco: {e}"
+            _mark_chapter_error(req.chapter_id, msg)
+            raise HTTPException(status_code=500, detail=msg)
+        finally:
+            if conn is not None:
+                conn.close()
+
+    return JSONResponse(
+        status_code=200,
+        content={
+            "chapter_id": req.chapter_id,
+            "status": "Extração Concluída",
+            "model": result["model"],
+            "total_frames": result["total_frames"],
+            "extracao_json_path": os.path.join(chapter_dir, "extracao_cap.json"),
+            "frames": [
+                {
+                    "scene_order": f["scene_order"],
+                    "clean_path": f["clean_path"],
+                    "frame_16_9_path": f["frame_16_9_path"],
+                    "dialogues": f["dialogues"],
+                    "visual_action": f["visual_action"],
+                    "extracted_ocr_text": f["extracted_ocr_text"],
+                }
+                for f in frames
             ],
         },
     )
