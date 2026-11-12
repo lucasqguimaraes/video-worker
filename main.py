@@ -21,26 +21,28 @@ from ocr_vision import (
     OcrError,
     extract_chapter_ocr,
 )
+from script_generator import (
+    ScriptError,
+    generate_chapter_script,
+)
 
-app = FastAPI(title="Video Machine - Slicer & OCR API", version="1.3.0")
+app = FastAPI(title="Video Machine - Slicer & OCR API", version="1.4.0")
+
+SHARED_MEDIA_MOUNT = os.path.dirname(SHARED_MEDIA_ROOT)
 
 REDIS_HOST = os.getenv("REDIS_HOST", "n8n_redis")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", "")
 REDIS_DB = 2
-
 DB_HOST = os.getenv("DB_HOST", "n8n_postgres")
 DB_NAME = os.getenv("DB_NAME", "video_machine")
 DB_USER = os.getenv("DB_USER", "n8n")
 DB_PASS = os.getenv("DB_PASS", "")
-
 OPENAI_API_KEY_ENV = os.getenv("OPENAI_API_KEY", "")
 
-# Impede dois fatiamentos pesados simultâneos (RAM limitada na VPS KVM2)
 slice_lock = threading.Lock()
-
-# Impede duas extrações de OCR/Vision simultâneas (controle de custo e carga)
 ocr_lock = threading.Lock()
+script_lock = threading.Lock()
 
 
 class SliceChapterRequest(BaseModel):
@@ -49,6 +51,15 @@ class SliceChapterRequest(BaseModel):
 
 
 class ExtractOcrRequest(BaseModel):
+    chapter_id: int
+    openai_api_key: Optional[str] = None
+
+
+class PrepareChapterRequest(BaseModel):
+    chapter_folder_name: str
+
+
+class GenerateScriptRequest(BaseModel):
     chapter_id: int
     openai_api_key: Optional[str] = None
 
@@ -111,9 +122,7 @@ def health():
     ffmpeg_ok = check_ffmpeg_installed()
     redis_ok = check_redis_db2()
     postgres_ok = check_postgres()
-
     all_ok = shared_ok and ffmpeg_ok and redis_ok and postgres_ok
-
     return {
         "status": "online" if all_ok else "degraded",
         "shared_volume_writable": shared_ok,
@@ -146,16 +155,36 @@ def _mark_chapter_error(chapter_id: int, message: str) -> None:
             conn.close()
 
 
+@app.post("/prepare-chapter")
+def prepare_chapter_endpoint(req: PrepareChapterRequest):
+    if not is_valid_chapter_folder(req.chapter_folder_name):
+        raise HTTPException(status_code=400, detail="chapter_folder_name inválido")
+    chapter_dir = os.path.join(SHARED_MEDIA_ROOT, req.chapter_folder_name)
+    raw_dir = os.path.join(chapter_dir, "raw")
+    try:
+        for path in (SHARED_MEDIA_MOUNT, SHARED_MEDIA_ROOT, chapter_dir, raw_dir):
+            os.makedirs(path, exist_ok=True)
+            os.chmod(path, 0o777)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Falha ao preparar pastas do capítulo: {e}")
+    return JSONResponse(
+        status_code=200,
+        content={
+            "status": "ok",
+            "chapter_folder_name": req.chapter_folder_name,
+            "chapter_dir": chapter_dir,
+            "raw_dir": raw_dir,
+        },
+    )
+
+
 @app.post("/slice-chapter")
 def slice_chapter_endpoint(req: SliceChapterRequest):
-    # Validação do nome da pasta antes de tocar em disco/banco
     if not is_valid_chapter_folder(req.chapter_folder_name):
         raise HTTPException(
             status_code=400,
             detail="chapter_folder_name inválido",
         )
-
-    # Verifica existência do capítulo
     try:
         conn = get_db_connection()
     except Exception as e:
@@ -163,21 +192,17 @@ def slice_chapter_endpoint(req: SliceChapterRequest):
             status_code=500,
             detail=f"Falha ao conectar no PostgreSQL: {e}",
         )
-
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT id FROM chapters WHERE id = %s", (req.chapter_id,))
             row = cur.fetchone()
     finally:
         conn.close()
-
     if row is None:
         raise HTTPException(
             status_code=404,
             detail=f"Capítulo {req.chapter_id} não encontrado",
         )
-
-    # Garante um fatiamento por vez
     with slice_lock:
         try:
             result = slice_chapter(req.chapter_folder_name)
@@ -193,10 +218,8 @@ def slice_chapter_endpoint(req: SliceChapterRequest):
             msg = f"Erro inesperado no corte: {e}"
             _mark_chapter_error(req.chapter_id, msg)
             raise HTTPException(status_code=500, detail=msg)
-
         panels = result.get("panels", [])
         chapter_dir = result["chapter_dir"]
-
         conn = None
         try:
             conn = get_db_connection()
@@ -206,7 +229,6 @@ def slice_chapter_endpoint(req: SliceChapterRequest):
                         "DELETE FROM scenes WHERE chapter_id = %s",
                         (req.chapter_id,),
                     )
-
                     if panels:
                         psycopg2.extras.execute_values(
                             cur,
@@ -223,7 +245,6 @@ def slice_chapter_endpoint(req: SliceChapterRequest):
                                 for p in panels
                             ],
                         )
-
                     cur.execute(
                         """
                         UPDATE chapters
@@ -242,7 +263,6 @@ def slice_chapter_endpoint(req: SliceChapterRequest):
         finally:
             if conn is not None:
                 conn.close()
-
     return JSONResponse(
         status_code=200,
         content={
@@ -276,8 +296,6 @@ def extract_ocr_endpoint(req: ExtractOcrRequest):
             status_code=400,
             detail="OPENAI_API_KEY não configurada (env ou openai_api_key no body)",
         )
-
-    # Busca capítulo e cenas no banco
     try:
         conn = get_db_connection()
     except Exception as e:
@@ -285,7 +303,6 @@ def extract_ocr_endpoint(req: ExtractOcrRequest):
             status_code=500,
             detail=f"Falha ao conectar no PostgreSQL: {e}",
         )
-
     try:
         with conn.cursor() as cur:
             cur.execute(
@@ -293,13 +310,11 @@ def extract_ocr_endpoint(req: ExtractOcrRequest):
                 (req.chapter_id,),
             )
             chapter_row = cur.fetchone()
-
             if chapter_row is None:
                 raise HTTPException(
                     status_code=404,
                     detail=f"Capítulo {req.chapter_id} não encontrado",
                 )
-
             cur.execute(
                 """
                 SELECT scene_order, panel_image_path
@@ -312,27 +327,21 @@ def extract_ocr_endpoint(req: ExtractOcrRequest):
             scene_rows = cur.fetchall()
     finally:
         conn.close()
-
     chapter_dir = chapter_row[1]
-
     if not chapter_dir:
         raise HTTPException(
             status_code=400,
             detail="Capítulo sem local_work_dir. Execute /slice-chapter antes.",
         )
-
     if not scene_rows:
         raise HTTPException(
             status_code=400,
             detail="Nenhuma cena encontrada para o capítulo. Execute /slice-chapter antes.",
         )
-
     scenes = [
         {"scene_order": row[0], "frame_16_9_path": row[1]}
         for row in scene_rows
     ]
-
-    # Garante uma extração de OCR por vez
     with ocr_lock:
         try:
             result = extract_chapter_ocr(
@@ -349,10 +358,7 @@ def extract_ocr_endpoint(req: ExtractOcrRequest):
             msg = f"Erro inesperado no OCR/Vision: {e}"
             _mark_chapter_error(req.chapter_id, msg)
             raise HTTPException(status_code=500, detail=msg)
-
         frames = result["frames"]
-
-        # Persiste no PostgreSQL
         conn = None
         try:
             conn = get_db_connection()
@@ -372,7 +378,6 @@ def extract_ocr_endpoint(req: ExtractOcrRequest):
                                 frame["scene_order"],
                             ),
                         )
-
                     cur.execute(
                         """
                         UPDATE chapters
@@ -393,7 +398,6 @@ def extract_ocr_endpoint(req: ExtractOcrRequest):
         finally:
             if conn is not None:
                 conn.close()
-
     return JSONResponse(
         status_code=200,
         content={
@@ -413,5 +417,127 @@ def extract_ocr_endpoint(req: ExtractOcrRequest):
                 }
                 for f in frames
             ],
+        },
+    )
+
+
+@app.post("/generate-script")
+def generate_script_endpoint(req: GenerateScriptRequest):
+    api_key = (req.openai_api_key or OPENAI_API_KEY_ENV).strip()
+    if not api_key:
+        raise HTTPException(
+            status_code=400,
+            detail="OPENAI_API_KEY não configurada (env ou openai_api_key no body)",
+        )
+    try:
+        conn = get_db_connection()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Falha ao conectar no PostgreSQL: {e}",
+        )
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, local_work_dir FROM chapters WHERE id = %s",
+                (req.chapter_id,),
+            )
+            chapter_row = cur.fetchone()
+            if chapter_row is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Capítulo {req.chapter_id} não encontrado",
+                )
+            cur.execute(
+                """
+                SELECT scene_order, extracted_ocr_text
+                  FROM scenes
+                 WHERE chapter_id = %s
+                 ORDER BY scene_order
+                """,
+                (req.chapter_id,),
+            )
+            scene_rows = cur.fetchall()
+    finally:
+        conn.close()
+    chapter_dir = chapter_row[1]
+    if not chapter_dir:
+        raise HTTPException(
+            status_code=400,
+            detail="Capítulo sem local_work_dir. Execute /slice-chapter antes.",
+        )
+    if not scene_rows:
+        raise HTTPException(
+            status_code=400,
+            detail="Nenhuma cena encontrada para o capítulo. Execute /slice-chapter antes.",
+        )
+    scenes = [
+        {"scene_order": row[0], "extracted_ocr_text": row[1]}
+        for row in scene_rows
+    ]
+    with script_lock:
+        try:
+            result = generate_chapter_script(
+                chapter_id=req.chapter_id,
+                chapter_dir=chapter_dir,
+                scenes=scenes,
+                api_key=api_key,
+            )
+        except ScriptError as e:
+            msg = str(e)
+            _mark_chapter_error(req.chapter_id, msg)
+            raise HTTPException(status_code=502, detail=msg)
+        except Exception as e:
+            msg = f"Erro inesperado na geração de roteiro: {e}"
+            _mark_chapter_error(req.chapter_id, msg)
+            raise HTTPException(status_code=500, detail=msg)
+        conn = None
+        try:
+            conn = get_db_connection()
+            with conn:
+                with conn.cursor() as cur:
+                    for scene in result["scenes"]:
+                        cur.execute(
+                            """
+                            UPDATE scenes
+                               SET narration_script = %s,
+                                   camera_effect = %s
+                             WHERE chapter_id = %s
+                               AND scene_order = %s
+                            """,
+                            (
+                                scene["narration_script"],
+                                scene["camera_effect"],
+                                req.chapter_id,
+                                scene["scene_order"],
+                            ),
+                        )
+                    cur.execute(
+                        """
+                        UPDATE chapters
+                           SET status = 'Roteiro Gerado',
+                               error_log = NULL,
+                               updated_at = CURRENT_TIMESTAMP
+                         WHERE id = %s
+                        """,
+                        (req.chapter_id,),
+                    )
+        except Exception as e:
+            msg = f"Falha ao gravar o roteiro no banco: {e}"
+            _mark_chapter_error(req.chapter_id, msg)
+            raise HTTPException(status_code=500, detail=msg)
+        finally:
+            if conn is not None:
+                conn.close()
+    return JSONResponse(
+        status_code=200,
+        content={
+            "chapter_id": req.chapter_id,
+            "status": "Roteiro Gerado",
+            "model": result["model"],
+            "total_scenes": result["total_scenes"],
+            "roteiro_json_path": result["roteiro_json_path"],
+            "full_script_markdown": result["full_script_markdown"],
+            "scenes": result["scenes"],
         },
     )
