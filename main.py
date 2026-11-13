@@ -25,8 +25,12 @@ from script_generator import (
     ScriptError,
     generate_chapter_script,
 )
+from tts_generator import (
+    TtsError,
+    generate_chapter_audio,
+)
 
-app = FastAPI(title="Video Machine - Slicer & OCR API", version="1.4.0")
+app = FastAPI(title="Video Machine - Slicer & OCR API", version="1.5.0")
 
 SHARED_MEDIA_MOUNT = os.path.dirname(SHARED_MEDIA_ROOT)
 
@@ -39,10 +43,13 @@ DB_NAME = os.getenv("DB_NAME", "video_machine")
 DB_USER = os.getenv("DB_USER", "n8n")
 DB_PASS = os.getenv("DB_PASS", "")
 OPENAI_API_KEY_ENV = os.getenv("OPENAI_API_KEY", "")
+ELEVENLABS_API_KEY_ENV = os.getenv("ELEVENLABS_API_KEY", "")
+VOICESTUDIO_BASE_URL_ENV = os.getenv("VOICESTUDIO_BASE_URL", "")
 
 slice_lock = threading.Lock()
 ocr_lock = threading.Lock()
 script_lock = threading.Lock()
+tts_lock = threading.Lock()
 
 
 class SliceChapterRequest(BaseModel):
@@ -62,6 +69,15 @@ class PrepareChapterRequest(BaseModel):
 class GenerateScriptRequest(BaseModel):
     chapter_id: int
     openai_api_key: Optional[str] = None
+
+
+class GenerateAudioRequest(BaseModel):
+    chapter_id: int
+    provider: str = "openai"
+    api_key: Optional[str] = None
+    voice_id: Optional[str] = None
+    base_url: Optional[str] = None
+    force_regenerate: bool = False
 
 
 def get_db_connection():
@@ -538,6 +554,133 @@ def generate_script_endpoint(req: GenerateScriptRequest):
             "total_scenes": result["total_scenes"],
             "roteiro_json_path": result["roteiro_json_path"],
             "full_script_markdown": result["full_script_markdown"],
+            "scenes": result["scenes"],
+        },
+    )
+
+
+@app.post("/generate-audio")
+def generate_audio_endpoint(req: GenerateAudioRequest):
+    provider = (req.provider or "openai").strip().lower()
+    if provider == "openai":
+        default_key = OPENAI_API_KEY_ENV
+    elif provider == "elevenlabs":
+        default_key = ELEVENLABS_API_KEY_ENV
+    else:
+        default_key = ""
+    api_key = (req.api_key or default_key).strip()
+    if provider in ("openai", "elevenlabs") and not api_key:
+        raise HTTPException(status_code=400, detail=f"API key não configurada para o provedor {provider}")
+    base_url = (req.base_url or VOICESTUDIO_BASE_URL_ENV).strip()
+    if provider == "voicestudio" and not base_url:
+        raise HTTPException(status_code=400, detail="base_url não configurada para o provedor voicestudio")
+    try:
+        conn = get_db_connection()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Falha ao conectar no PostgreSQL: {e}")
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, local_work_dir FROM chapters WHERE id = %s",
+                (req.chapter_id,),
+            )
+            chapter_row = cur.fetchone()
+            if chapter_row is None:
+                raise HTTPException(status_code=404, detail=f"Capítulo {req.chapter_id} não encontrado")
+            cur.execute(
+                """
+                SELECT scene_order, narration_script
+                  FROM scenes
+                 WHERE chapter_id = %s
+                 ORDER BY scene_order
+                """,
+                (req.chapter_id,),
+            )
+            scene_rows = cur.fetchall()
+    finally:
+        conn.close()
+    chapter_dir = chapter_row[1]
+    if not chapter_dir:
+        raise HTTPException(status_code=400, detail="Capítulo sem local_work_dir. Execute /slice-chapter antes.")
+    if not scene_rows:
+        raise HTTPException(
+            status_code=400,
+            detail="Nenhuma cena encontrada para o capítulo. Execute /generate-script antes.",
+        )
+    scenes = [{"scene_order": row[0], "narration_script": row[1]} for row in scene_rows]
+    with tts_lock:
+        try:
+            result = generate_chapter_audio(
+                chapter_id=req.chapter_id,
+                chapter_dir=chapter_dir,
+                scenes=scenes,
+                provider=provider,
+                api_key=api_key,
+                voice_id=(req.voice_id or "").strip(),
+                base_url=base_url,
+                force_regenerate=req.force_regenerate,
+            )
+        except TtsError as e:
+            msg = str(e)
+            _mark_chapter_error(req.chapter_id, msg)
+            raise HTTPException(status_code=502, detail=msg)
+        except Exception as e:
+            msg = f"Erro inesperado no TTS: {e}"
+            _mark_chapter_error(req.chapter_id, msg)
+            raise HTTPException(status_code=500, detail=msg)
+        conn = None
+        try:
+            conn = get_db_connection()
+            with conn:
+                with conn.cursor() as cur:
+                    for scene in result["scenes"]:
+                        cur.execute(
+                            """
+                            UPDATE scenes
+                               SET audio_path = %s,
+                                   duration_ms = %s,
+                                   start_time_ms = %s,
+                                   end_time_ms = %s
+                             WHERE chapter_id = %s
+                               AND scene_order = %s
+                            """,
+                            (
+                                scene["audio_path"],
+                                scene["duration_ms"],
+                                scene["start_time_ms"],
+                                scene["end_time_ms"],
+                                req.chapter_id,
+                                scene["scene_order"],
+                            ),
+                        )
+                    cur.execute(
+                        """
+                        UPDATE chapters
+                           SET status = 'Renderizando',
+                               error_log = NULL,
+                               updated_at = CURRENT_TIMESTAMP
+                         WHERE id = %s
+                        """,
+                        (req.chapter_id,),
+                    )
+        except Exception as e:
+            msg = f"Falha ao gravar o áudio no banco: {e}"
+            _mark_chapter_error(req.chapter_id, msg)
+            raise HTTPException(status_code=500, detail=msg)
+        finally:
+            if conn is not None:
+                conn.close()
+    return JSONResponse(
+        status_code=200,
+        content={
+            "chapter_id": req.chapter_id,
+            "status": "Renderizando",
+            "provider": result["provider"],
+            "voice_id": result["voice_id"],
+            "total_scenes": result["total_scenes"],
+            "total_duration_ms": result["total_duration_ms"],
+            "total_duration_seconds": result["total_duration_seconds"],
+            "manifest_json_path": result["manifest_json_path"],
             "scenes": result["scenes"],
         },
     )
